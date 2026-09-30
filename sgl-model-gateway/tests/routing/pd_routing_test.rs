@@ -219,6 +219,123 @@ mod pd_routing_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Prefill takes this long to answer; a router that waits for it after an
+    /// early decode failure would take at least this long to respond.
+    const SLOW_PREFILL_DELAY_MS: u64 = 3000;
+    /// Generous bound for an early-returning router, well below the prefill delay.
+    const EARLY_RETURN_BOUND_MS: u128 = 1500;
+
+    /// Sends one request to a PD router whose only prefill is slow and whose only
+    /// decode always fails immediately, and returns (status, elapsed_ms).
+    async fn run_early_decode_failure(
+        prefill_port: u16,
+        decode_port: u16,
+        router_port: u16,
+        max_retries: u32,
+        stream: bool,
+    ) -> (StatusCode, u128) {
+        use smg::config::RetryConfig;
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{prefill_port}"), None)],
+                vec![format!("http://127.0.0.1:{decode_port}")],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(router_port)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(60)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                ..Default::default()
+            })
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                MockWorkerConfig {
+                    port: prefill_port,
+                    worker_type: WorkerType::Prefill,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: SLOW_PREFILL_DELAY_MS,
+                    fail_rate: 0.0,
+                },
+                MockWorkerConfig {
+                    port: decode_port,
+                    worker_type: WorkerType::Decode,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 0,
+                    fail_rate: 1.0,
+                },
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "text": "Early decode failure must not wait for prefill",
+            "stream": stream
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        let elapsed_ms = start.elapsed().as_millis();
+        let status = resp.status();
+
+        ctx.shutdown().await;
+        (status, elapsed_ms)
+    }
+
+    /// #658: when decode rejects a request before prefill finishes, the router
+    /// must return immediately (dropping the prefill connection) instead of
+    /// holding prefill compute until prefill completes.
+    #[tokio::test]
+    async fn test_early_decode_failure_does_not_wait_for_prefill() {
+        let (status, elapsed_ms) = run_early_decode_failure(19860, 19861, 3806, 0, false).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            elapsed_ms < EARLY_RETURN_BOUND_MS,
+            "router waited {elapsed_ms}ms for a doomed prefill (prefill delay {SLOW_PREFILL_DELAY_MS}ms)"
+        );
+    }
+
+    /// Streaming variant of the #658 early-return behavior.
+    #[tokio::test]
+    async fn test_early_decode_failure_does_not_wait_for_prefill_streaming() {
+        let (status, elapsed_ms) = run_early_decode_failure(19870, 19871, 3807, 0, true).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            elapsed_ms < EARLY_RETURN_BOUND_MS,
+            "router waited {elapsed_ms}ms for a doomed prefill (prefill delay {SLOW_PREFILL_DELAY_MS}ms)"
+        );
+    }
+
+    /// With retries enabled (the production default), every attempt must return
+    /// early, so the total stays far below even a single prefill delay.
+    #[tokio::test]
+    async fn test_early_decode_failure_with_retries_does_not_wait_for_prefill() {
+        let (status, elapsed_ms) = run_early_decode_failure(19880, 19881, 3808, 2, false).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            elapsed_ms < EARLY_RETURN_BOUND_MS,
+            "3 attempts took {elapsed_ms}ms; at least one waited for prefill (delay {SLOW_PREFILL_DELAY_MS}ms)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -707,5 +824,270 @@ mod pd_responses_routing_tests {
                 .and_then(|v| v.to_str().ok()),
             Some("pd_unsupported_background_responses")
         );
+    }
+}
+
+/// #658: a streaming decode commits 200 headers before validating the request,
+/// so the engine reports a rejection as an in-band SSE error event, not a
+/// non-2xx. These workers reproduce that shape over real HTTP.
+#[cfg(test)]
+mod pd_early_stream_error_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use axum::routing::post;
+    use futures::StreamExt;
+    use http_body_util::BodyExt;
+    use smg::{
+        config::{PolicyConfig, RetryConfig},
+        core::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType as CoreWorkerType},
+        policies::PolicyRegistry,
+        protocols::generate::GenerateRequest,
+        routers::{pd_router::PDRouter, RouterTrait},
+    };
+    use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+
+    use super::*;
+
+    /// What an SGLang decode engine streams for an over-long prompt (observed
+    /// on TPU v7x with a decode `--context-length` below the prompt length).
+    const ENGINE_ERROR_STREAM: &str = "data: {\"error\":{\"message\":\"The input (2501 tokens) is longer than the model's context length (1024 tokens).\",\"type\":\"invalid_request_error\",\"code\":400,\"retryable\":false}}\n\ndata: [DONE]\n\n";
+    const TOKEN_STREAM: &str = "data: {\"text\":\"tok\",\"meta_info\":{}}\n\ndata: [DONE]\n\n";
+    const SLOW_PREFILL_MS: u64 = 3000;
+    const EARLY_RETURN_BOUND: Duration = Duration::from_millis(1500);
+
+    /// Prefill that completes after `delay_ms`, counting completions. With
+    /// `headers_first` it behaves like a real engine serving a streaming
+    /// request: 200 headers at once, body held open until prefill is done.
+    async fn spawn_prefill(
+        delay_ms: u64,
+        headers_first: bool,
+        completed: Arc<AtomicUsize>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/generate",
+            post(move || {
+                let completed = completed.clone();
+                async move {
+                    let finish = async move {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from("data: {}\n\n"))
+                    };
+                    let body = if headers_first {
+                        Body::from_stream(futures::stream::once(finish))
+                    } else {
+                        Body::from(finish.await.unwrap())
+                    };
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), task)
+    }
+
+    /// Decode that immediately answers 200 SSE and streams `chunks`, pausing
+    /// `gap_ms` between them.
+    async fn spawn_decode(chunks: Vec<&'static str>, gap_ms: u64) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/generate",
+            post(move || {
+                let chunks = chunks.clone();
+                async move {
+                    let body = futures::stream::iter(chunks).then(move |chunk| async move {
+                        tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk))
+                    });
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), task)
+    }
+
+    fn make_router(prefill_url: String, decode_url: String, max_retries: u32) -> PDRouter {
+        let router = PDRouter {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            client: reqwest::Client::new(),
+            retry_config: RetryConfig {
+                max_retries,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                ..Default::default()
+            },
+            api_key: None,
+            enable_igw: false,
+        };
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(CoreWorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        prefill.set_healthy(true);
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(CoreWorkerType::Decode)
+            .build();
+        decode.set_healthy(true);
+        router.worker_registry.register(Arc::new(prefill));
+        router.worker_registry.register(Arc::new(decode));
+        router
+    }
+
+    /// Routes one streaming /generate and returns (status, body, elapsed).
+    async fn stream_once(router: &PDRouter) -> (StatusCode, String, Duration) {
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"text": "hello", "stream": true})).unwrap();
+        let start = Instant::now();
+        let (status, body) = timeout(Duration::from_secs(20), async {
+            let response = router.route_generate(None, &request, None).await;
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        })
+        .await
+        .expect("PD stream must complete");
+        (status, body, start.elapsed())
+    }
+
+    /// The in-band error is relayed unchanged without waiting for prefill.
+    #[tokio::test]
+    async fn test_in_band_decode_stream_error_does_not_wait_for_prefill() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_prefill(SLOW_PREFILL_MS, false, completed.clone()).await;
+        let (decode_url, d) = spawn_decode(vec![ENGINE_ERROR_STREAM], 0).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, ENGINE_ERROR_STREAM);
+        assert!(
+            elapsed < EARLY_RETURN_BOUND,
+            "router waited {elapsed:?} for a doomed prefill (delay {SLOW_PREFILL_MS}ms)"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        p.abort();
+        d.abort();
+    }
+
+    /// An error event split across chunks is still recognized, and all bytes
+    /// read while peeking are relayed.
+    #[tokio::test]
+    async fn test_split_in_band_decode_stream_error_does_not_wait_for_prefill() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_prefill(SLOW_PREFILL_MS, false, completed).await;
+        let (split_at, _) = ENGINE_ERROR_STREAM.split_once("\"message\"").unwrap();
+        let rest = &ENGINE_ERROR_STREAM[split_at.len()..];
+        let (decode_url, d) = spawn_decode(vec![split_at, rest], 50).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, ENGINE_ERROR_STREAM);
+        assert!(elapsed < EARLY_RETURN_BOUND, "router waited {elapsed:?}");
+        p.abort();
+        d.abort();
+    }
+
+    /// A 2xx decode stream that closes without an event is a decode fault; it
+    /// must neither wait for prefill nor be relayed as a success.
+    #[tokio::test]
+    async fn test_empty_decode_stream_does_not_wait_for_prefill() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_prefill(SLOW_PREFILL_MS, false, completed).await;
+        let (decode_url, d) = spawn_decode(vec![], 0).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, _, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(elapsed < EARLY_RETURN_BOUND, "router waited {elapsed:?}");
+        p.abort();
+        d.abort();
+    }
+
+    /// Regression guard: a normal first event must not cancel prefill. The
+    /// router still awaits prefill and relays the peeked bytes unchanged.
+    #[tokio::test]
+    async fn test_normal_decode_stream_still_awaits_prefill() {
+        let prefill_delay_ms = 500;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_prefill(prefill_delay_ms, false, completed.clone()).await;
+        let (decode_url, d) = spawn_decode(vec![TOKEN_STREAM], 0).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, TOKEN_STREAM);
+        assert!(
+            elapsed >= Duration::from_millis(prefill_delay_ms),
+            "router returned after {elapsed:?} without awaiting prefill"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        p.abort();
+        d.abort();
+    }
+
+    /// A streaming prefill answers 200 headers at once; its completion is the
+    /// end of its body. The in-band decode error must still win even when
+    /// prefill's headers arrive first (the race seen on TPU v7x).
+    #[tokio::test]
+    async fn test_in_band_decode_error_with_streaming_prefill_does_not_wait() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_prefill(SLOW_PREFILL_MS, true, completed.clone()).await;
+        // Decode's error trails prefill's headers.
+        let (decode_url, d) = spawn_decode(vec![ENGINE_ERROR_STREAM], 100).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, ENGINE_ERROR_STREAM);
+        assert!(
+            elapsed < EARLY_RETURN_BOUND,
+            "router waited {elapsed:?} for a doomed prefill (delay {SLOW_PREFILL_MS}ms)"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        p.abort();
+        d.abort();
+    }
+
+    /// Regression guard for the streaming-prefill shape: decode is relayed only
+    /// after prefill's body ends, as before.
+    #[tokio::test]
+    async fn test_normal_decode_stream_awaits_streaming_prefill_body() {
+        let prefill_delay_ms = 500;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_prefill(prefill_delay_ms, true, completed.clone()).await;
+        let (decode_url, d) = spawn_decode(vec![TOKEN_STREAM], 0).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, TOKEN_STREAM);
+        assert!(
+            elapsed >= Duration::from_millis(prefill_delay_ms),
+            "router returned after {elapsed:?} without awaiting prefill's body"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        p.abort();
+        d.abort();
     }
 }
