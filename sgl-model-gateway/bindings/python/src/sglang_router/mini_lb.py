@@ -56,6 +56,7 @@ def _response_failed(task: asyncio.Task) -> bool:
 
 
 async def _post_prefill_and_decode(
+    *,
     prefill_request: Awaitable[aiohttp.ClientResponse],
     decode_request: Awaitable[aiohttp.ClientResponse],
 ) -> Tuple[Optional[aiohttp.ClientResponse], Optional[aiohttp.ClientResponse]]:
@@ -310,13 +311,13 @@ class MiniLoadBalancer:
 
         async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
             prefill_response, decode_response = await _post_prefill_and_decode(
-                self._engine_request(
+                prefill_request=self._engine_request(
                     prefill_server,
                     session.post,
                     f"{prefill_server}/{endpoint}",
                     json=prefill_req,
                 ),
-                self._engine_request(
+                decode_request=self._engine_request(
                     decode_server,
                     session.post,
                     f"{decode_server}/{endpoint}",
@@ -436,13 +437,13 @@ class MiniLoadBalancer:
             # streaming response (and its 200 status) is committed. A side
             # still pending when the other fails is cancelled (None).
             prefill_response, decode_response = await _post_prefill_and_decode(
-                self._engine_request(
+                prefill_request=self._engine_request(
                     prefill_server,
                     session.post,
                     f"{prefill_server}/{endpoint}",
                     json=modified_request,
                 ),
-                self._engine_request(
+                decode_request=self._engine_request(
                     decode_server,
                     session.post,
                     f"{decode_server}/{endpoint}",

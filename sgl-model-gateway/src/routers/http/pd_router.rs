@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -116,6 +116,16 @@ impl EarlyDecodeStreamFailure {
             Self::Ended => "stream ended early",
         }
     }
+}
+
+/// What `race_prefill_against_decode` saw before it stopped polling.
+struct DispatchRace {
+    /// `None` if decode failed before prefill completed.
+    prefill: Option<reqwest::Result<PrefillResponse>>,
+    decode_early: Option<reqwest::Result<reqwest::Response>>,
+    /// Decode body bytes read while peeking; replayed ahead of the stream.
+    decode_prefix: Vec<u8>,
+    decode_stream_failure: Option<EarlyDecodeStreamFailure>,
 }
 
 /// Upper bound on bytes buffered while waiting for decode's first SSE event.
@@ -593,7 +603,7 @@ impl PDRouter {
     /// Cancel-safe: `reqwest::Response::chunk` only consumes a chunk when it
     /// returns it, so dropping it when prefill wins loses no bytes.
     async fn next_early_decode_chunk(
-        decode: &mut Option<Result<reqwest::Response, reqwest::Error>>,
+        decode: &mut Option<reqwest::Result<reqwest::Response>>,
     ) -> reqwest::Result<Option<bytes::Bytes>> {
         match decode {
             Some(Ok(res)) => res.chunk().await,
@@ -610,6 +620,147 @@ impl PDRouter {
     {
         let prefix = (!prefix.is_empty()).then(|| Ok(bytes::Bytes::from(prefix)));
         futures_util::stream::iter(prefix).chain(res.bytes_stream())
+    }
+
+    /// Polls prefill and decode until prefill completes (its body has been
+    /// read, see `PrefillResponse`) or decode fails. Decode normally resolves
+    /// later, but may resolve first if it rejects the request outright
+    /// (non-2xx) or fails at the transport level. An early decode success is
+    /// stashed and prefill is awaited.
+    ///
+    /// A streaming decode commits its 200 headers before validating the
+    /// request, so the engine reports e.g. an over-long prompt as an in-band
+    /// SSE error event instead of a non-2xx status. While prefill is still
+    /// pending, read the stashed stream up to its first event; if that is an
+    /// error, decode has failed just like a non-2xx. Any bytes read are kept
+    /// in `decode_prefix` and replayed ahead of the rest of the stream.
+    async fn race_prefill_against_decode(
+        mut prefill_fut: Pin<&mut impl Future<Output = reqwest::Result<PrefillResponse>>>,
+        mut decode_fut: Pin<&mut impl Future<Output = reqwest::Result<reqwest::Response>>>,
+        is_stream: bool,
+    ) -> DispatchRace {
+        let mut prefill_result = None;
+        let mut decode_early: Option<reqwest::Result<reqwest::Response>> = None;
+        let mut decode_prefix: Vec<u8> = Vec::new();
+        let mut peek_decode_stream = is_stream;
+        let mut decode_stream_failure: Option<EarlyDecodeStreamFailure> = None;
+        loop {
+            tokio::select! {
+                biased;
+                pr = prefill_fut.as_mut() => {
+                    prefill_result = Some(pr);
+                    break;
+                }
+                dr = decode_fut.as_mut(), if decode_early.is_none() => {
+                    let decode_failed = match &dr {
+                        Ok(resp) => !resp.status().is_success(),
+                        Err(_) => true,
+                    };
+                    decode_early = Some(dr);
+                    if decode_failed {
+                        break;
+                    }
+                }
+                chunk = Self::next_early_decode_chunk(&mut decode_early),
+                    if peek_decode_stream && decode_early.is_some() =>
+                {
+                    match chunk {
+                        Ok(Some(bytes)) => {
+                            decode_prefix.extend_from_slice(&bytes);
+                            match first_sse_event_is_error(&decode_prefix) {
+                                Some(true) => {
+                                    decode_stream_failure = Some(EarlyDecodeStreamFailure::ErrorEvent);
+                                    break;
+                                }
+                                Some(false) => peek_decode_stream = false,
+                                None => {} // first event incomplete; keep reading
+                            }
+                        }
+                        Ok(None) => {
+                            decode_stream_failure = Some(EarlyDecodeStreamFailure::Ended);
+                            break;
+                        }
+                        Err(e) => {
+                            decode_early = Some(Err(e));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        DispatchRace {
+            prefill: prefill_result,
+            decode_early,
+            decode_prefix,
+            decode_stream_failure,
+        }
+    }
+
+    /// Response for a decode that failed before prefill completed. Dropping the
+    /// caller's pending prefill future afterwards cancels the prefill request.
+    async fn early_decode_failure_response(
+        &self,
+        decode_early: Option<reqwest::Result<reqwest::Response>>,
+        decode_stream_failure: Option<EarlyDecodeStreamFailure>,
+        decode_prefix: Vec<u8>,
+        context: &PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        warn!(
+            "Decode failed before prefill completed ({}), cancelling paired prefill request prefill_url={} decode_url={}",
+            decode_stream_failure.map_or("error response", EarlyDecodeStreamFailure::as_str),
+            prefill.url(),
+            decode.url()
+        );
+        // Don't record prefill: it was cancelled due to a decode fault, not
+        // its own, so a decode error storm can neither trip nor (by recording
+        // a success it never earned) mask the state of prefill breakers.
+        let mut response = match (decode_early, decode_stream_failure) {
+            (Some(Ok(res)), Some(EarlyDecodeStreamFailure::ErrorEvent)) => {
+                // Relay decode's own error event unchanged. The
+                // `BreakerTrackedStream` in `create_streaming_response`
+                // ticks decode, as it would have had prefill been awaited.
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+                self.create_streaming_response(
+                    Self::replay_decode_stream(decode_prefix, res),
+                    status,
+                    None,
+                    context.return_logprob,
+                    Some(response_headers),
+                    prefill,
+                    decode,
+                )
+            }
+            (Some(Ok(_)), Some(EarlyDecodeStreamFailure::Ended)) => {
+                // A 2xx stream that closed without a complete event is a
+                // decode fault, not a response worth relaying.
+                decode.record_outcome(false);
+                error::bad_gateway(
+                    "decode_stream_ended",
+                    "Decode stream ended before prefill completed".to_string(),
+                )
+            }
+            (Some(Ok(res)), None) => {
+                // Streaming: `handle_decode_error_response` wraps the error
+                // SSE in a `BreakerTrackedStream` that ticks decode on drop.
+                if !context.is_stream {
+                    decode.record_outcome(res.status().is_client_error());
+                }
+                self.handle_decode_error_response(res, context, prefill, decode)
+                    .await
+            }
+            (Some(Err(e)), _) => {
+                error!(decode_url = %decode.url(), error = %e, "Decode request failed");
+                decode.record_outcome(false);
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+            }
+            (None, _) => unreachable!("select loop exits early only after a decode failure"),
+        };
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        response
     }
 
     async fn handle_decode_error_response(
@@ -805,66 +956,17 @@ impl PDRouter {
         tokio::pin!(prefill_fut);
         tokio::pin!(decode_fut);
 
-        // Poll both until prefill completes or decode fails. Decode normally
-        // resolves later, but may resolve first if it rejects the request
-        // outright (non-2xx) or fails at the transport level. An early decode
-        // success (e.g. streaming headers) is stashed and prefill is awaited.
-        //
-        // A streaming decode commits its 200 headers before validating the
-        // request, so the engine reports e.g. an over-long prompt as an in-band
-        // SSE error event instead of a non-2xx status. While prefill is still
-        // pending, read the stashed stream up to its first event; if that is an
-        // error, decode has failed just like a non-2xx. Any bytes read are kept
-        // in `decode_prefix` and replayed ahead of the rest of the stream.
-        let mut prefill_result = None;
-        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
-        let mut decode_prefix: Vec<u8> = Vec::new();
-        let mut peek_decode_stream = context.is_stream;
-        let mut decode_stream_failure: Option<EarlyDecodeStreamFailure> = None;
-        loop {
-            tokio::select! {
-                biased;
-                pr = &mut prefill_fut => {
-                    prefill_result = Some(pr);
-                    break;
-                }
-                dr = &mut decode_fut, if decode_early.is_none() => {
-                    let decode_failed = match &dr {
-                        Ok(resp) => !resp.status().is_success(),
-                        Err(_) => true,
-                    };
-                    decode_early = Some(dr);
-                    if decode_failed {
-                        break;
-                    }
-                }
-                chunk = Self::next_early_decode_chunk(&mut decode_early),
-                    if peek_decode_stream && decode_early.is_some() =>
-                {
-                    match chunk {
-                        Ok(Some(bytes)) => {
-                            decode_prefix.extend_from_slice(&bytes);
-                            match first_sse_event_is_error(&decode_prefix) {
-                                Some(true) => {
-                                    decode_stream_failure = Some(EarlyDecodeStreamFailure::ErrorEvent);
-                                    break;
-                                }
-                                Some(false) => peek_decode_stream = false,
-                                None => {} // first event incomplete; keep reading
-                            }
-                        }
-                        Ok(None) => {
-                            decode_stream_failure = Some(EarlyDecodeStreamFailure::Ended);
-                            break;
-                        }
-                        Err(e) => {
-                            decode_early = Some(Err(e));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let DispatchRace {
+            prefill: prefill_result,
+            decode_early,
+            decode_prefix,
+            decode_stream_failure,
+        } = Self::race_prefill_against_decode(
+            prefill_fut.as_mut(),
+            decode_fut.as_mut(),
+            context.is_stream,
+        )
+        .await;
 
         // Prefill's KV is useless without a live decode, so an early decode
         // failure dooms the paired prefill request. A decode that rejects the
@@ -877,60 +979,16 @@ impl PDRouter {
         // request it derived from this one (including parallel-sampling and
         // batch items, whose rids only it knows) in ~4-8s.
         let Some(prefill_result) = prefill_result else {
-            warn!(
-                "Decode failed before prefill completed ({}), cancelling paired prefill request prefill_url={} decode_url={}",
-                decode_stream_failure.map_or("error response", EarlyDecodeStreamFailure::as_str),
-                prefill.url(),
-                decode.url()
-            );
-            // Don't record prefill: it was cancelled due to a decode fault, not
-            // its own, so a decode error storm can neither trip nor (by recording
-            // a success it never earned) mask the state of prefill breakers.
-            let mut response = match (decode_early, decode_stream_failure) {
-                (Some(Ok(res)), Some(EarlyDecodeStreamFailure::ErrorEvent)) => {
-                    // Relay decode's own error event unchanged. The
-                    // `BreakerTrackedStream` in `create_streaming_response`
-                    // ticks decode, as it would have had prefill been awaited.
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let response_headers = header_utils::preserve_response_headers(res.headers());
-                    self.create_streaming_response(
-                        Self::replay_decode_stream(decode_prefix, res),
-                        status,
-                        None,
-                        context.return_logprob,
-                        Some(response_headers),
-                        prefill,
-                        decode,
-                    )
-                }
-                (Some(Ok(_)), Some(EarlyDecodeStreamFailure::Ended)) => {
-                    // A 2xx stream that closed without a complete event is a
-                    // decode fault, not a response worth relaying.
-                    decode.record_outcome(false);
-                    error::bad_gateway(
-                        "decode_stream_ended",
-                        "Decode stream ended before prefill completed".to_string(),
-                    )
-                }
-                (Some(Ok(res)), None) => {
-                    // Streaming: `handle_decode_error_response` wraps the error
-                    // SSE in a `BreakerTrackedStream` that ticks decode on drop.
-                    if !context.is_stream {
-                        decode.record_outcome(res.status().is_client_error());
-                    }
-                    self.handle_decode_error_response(res, &context, prefill, decode)
-                        .await
-                }
-                (Some(Err(e)), _) => {
-                    error!(decode_url = %decode.url(), error = %e, "Decode request failed");
-                    decode.record_outcome(false);
-                    error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
-                }
-                (None, _) => unreachable!("select loop exits early only after a decode failure"),
-            };
-            response.extensions_mut().insert(BreakerOutcomesRecorded);
-            return response;
+            return self
+                .early_decode_failure_response(
+                    decode_early,
+                    decode_stream_failure,
+                    decode_prefix,
+                    &context,
+                    prefill,
+                    decode,
+                )
+                .await;
         };
 
         // Decode can't generate without prefill's KV, so any prefill failure
