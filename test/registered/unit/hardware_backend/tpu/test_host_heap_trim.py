@@ -94,8 +94,8 @@ class TestInstall(CustomTestCase):
         enter_scope(self, get_context().override_server_args(model_path=directory))
         self.group = MagicMock(local_rank=0)
         enter_scope(self, get_parallel().override(world_group=self.group))
-        self.join_writers = enter_scope(self, 
-            patch.object(page_cache, "resolve_compilations", MagicMock())
+        self.join_writers = enter_scope(
+            self, patch.object(page_cache, "resolve_compilations", MagicMock())
         )
         enter_scope(self, patch.object(page_cache, "_checkpoint_release", None))
         self.advise = enter_scope(self, patch.object(page_cache.os, "posix_fadvise"))
@@ -220,7 +220,9 @@ class TestInstall(CustomTestCase):
         for mode in ("serial", "overlap"):
             with (
                 self.subTest(mode=mode),
-                get_context().override_server_args(startup_weight_load_mode=mode),
+                get_context().override_server_args(
+                    model_path=str(self.directory), startup_weight_load_mode=mode
+                ),
                 tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(True),
                 tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
                 tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
