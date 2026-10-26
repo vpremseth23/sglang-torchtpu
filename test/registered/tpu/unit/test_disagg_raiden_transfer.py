@@ -961,6 +961,74 @@ class TestRaidenStateEngine(RaidenRendezvousTestCase):
         self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32010")
 
 
+class TestRaidenSwaSlotBudget(RaidenRendezvousTestCase):
+    def _build(
+        self,
+        *,
+        budget_mib: float,
+        full_blocks: int = 64,
+        swa_blocks: int = 3,
+        full_layers: int = 1,
+        swa_layers: int = 3,
+    ):
+        # 1 rank, 1 host (local_ranks=1), page_size=64, element_size=2, 8 kv_heads, head_dim=128
+        # 1 block = 64 * 2 * 8 * 128 * 2 = 262,144 bytes = 0.25 MiB.
+        # With full_layers=1, full_blocks=64: full slot = 16 MiB.
+        # With swa_layers=3, swa_blocks=3: swa slot = 2.25 MiB.
+        m = self._prefill(attn_tp_rank=0, attn_tp_size=1)
+        built = []
+
+        class Engine:
+            def __init__(self, **kwargs):
+                built.append(kwargs)
+
+        m._engine = None
+        m._state_kv_caches = ()
+        m._kv_caches = [
+            torch.zeros(1, 64, 2, 8, 128, dtype=torch.bfloat16)
+            for _ in range(full_layers)
+        ]
+        m._swa_kv_caches = [
+            torch.zeros(1, 64, 2, 8, 128, dtype=torch.bfloat16)
+            for _ in range(swa_layers)
+        ]
+        m._max_request_blocks = lambda: full_blocks
+        m._swa_max_request_blocks = lambda: swa_blocks
+        m._slot_ceiling = lambda: 64
+        m.server_args = SimpleNamespace(nnodes=1, context_length=1024)
+
+        with (
+            patch.dict(
+                os.environ, {"SGLANG_RAIDEN_HOST_POOL_GB": str(budget_mib / 1024)}
+            ),
+            patch.dict(sys.modules, _fake_tpu_sync(Engine)),
+        ):
+            m._build_engine()
+
+        full, window = built[0], built[1]
+        return full["num_slots"], window["num_slots"]
+
+    def test_window_engine_never_has_more_slots_than_the_full_attention_one(self):
+        """A full slot stages 16 MiB and a window slot 2.25 MiB. 128 MiB affords
+        7 pairs; 143.75 MiB leaves the full-attention engine one more slot."""
+        cases = [
+            (128, (7, 7)),
+            (143.75, (8, 7)),
+        ]
+        for budget_mib, expected in cases:
+            with self.subTest(budget_mib=budget_mib):
+                slots = self._build(budget_mib=budget_mib)
+                self.assertEqual(slots, expected)
+
+    def test_paired_sizing_avoids_large_context_startup_crash(self):
+        """A 9 GiB full slot exceeds half of a 16 GiB rank budget; paired
+        sizing still fits one pair."""
+        # full_blocks=36864 -> 36864 * 0.25 MiB = 9216 MiB (9.00 GiB).
+        # Budget 16 GiB (16384 MiB): paired slot = 9218.25 MiB <= 16384 MiB.
+        slots = self._build(budget_mib=16384, full_blocks=36864)
+        self.assertEqual(slots, (1, 1))
+
+
 class TestRaidenStateGroups(CustomTestCase):
     def _hybrid_pool(self, *, mamba_pool):
         pool = HybridLinearKVPool.__new__(HybridLinearKVPool)

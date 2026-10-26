@@ -424,9 +424,32 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
-        engines = 1 + bool(self._swa_kv_caches) + bool(self._state_kv_caches)
+        # Full attention and its sliding window pair their slots (a transfer holds one
+        # on each), as pp_swa.plan_slots does on the pipeline path; only a GDN state
+        # engine still takes an even share.
+        engines = 1 + bool(self._state_kv_caches)
         max_blocks = self._max_request_blocks()
-        num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
+        reserved = 0
+        swa_num_slots = None
+        swa_max_blocks = None
+        if self._swa_kv_caches:
+            swa_max_blocks = self._swa_max_request_blocks()
+            swa_num_slots = self._num_slots(
+                self._swa_kv_caches,
+                swa_max_blocks,
+                engines=engines,
+                paired_slot_bytes=slot_host_bytes(self._kv_caches, max_blocks),
+            )
+            reserved = swa_num_slots * slot_host_bytes(
+                self._swa_kv_caches, swa_max_blocks
+            )
+
+        num_slots = self._num_slots(
+            self._kv_caches,
+            max_blocks,
+            engines=engines,
+            reserved_bytes=reserved,
+        )
         self.raiden_endpoint, self._engine = self._start_engine(
             kv_caches=self._kv_caches,
             port=self._control_port,
@@ -449,10 +472,6 @@ class RaidenKVManager(
             self._transfer_parallelism,
         )
         if self._swa_kv_caches:
-            swa_max_blocks = self._swa_max_request_blocks()
-            swa_num_slots = self._num_slots(
-                self._swa_kv_caches, swa_max_blocks, engines
-            )
             self.swa_raiden_endpoint, self._swa_engine = self._start_engine(
                 kv_caches=self._swa_kv_caches,
                 port=self._control_port + SWA_PORT_OFFSET,
