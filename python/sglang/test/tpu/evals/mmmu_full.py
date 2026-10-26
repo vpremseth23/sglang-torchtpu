@@ -36,6 +36,7 @@ def run_shard(
     temperature: float,
     top_p: float,
     chat_template_kwargs: dict | None = None,
+    aggregate: dict | None = None,
 ) -> dict:
     """Score one shard of MMMU-Pro and print its summary for the collector."""
     output = Path(tempfile.mkdtemp(prefix=f"mmmu-pro-shard-{shard}-"))
@@ -83,6 +84,8 @@ def run_shard(
 
     archive_results(files[0].parent)
     summary = {
+        "model": model,
+        "aggregate": aggregate,
         "shard": shard,
         "shards": shards,
         "questions": result["num_examples"],

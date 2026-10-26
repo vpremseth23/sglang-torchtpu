@@ -1,0 +1,26 @@
+# Zero-shot, 50 examples per subject, matching the GPT-OSS TPU MMLU-Pro gate.
+# Initial regression reference. Calibrate against the full TPU result.
+model_name: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
+backend: "local-chat-completions"
+api: "chat"
+tasks:
+  - name: "mmlu_pro"
+    metrics:
+      - name: "exact_match,custom-extract"
+        value: 0.85
+rtol: 0.0
+atol: 0.10
+limit: 50
+num_fewshot: 0
+num_concurrent: 8
+batch_size: "auto"
+apply_chat_template: true
+archive_predictions: true
+model_args:
+  timeout: 1800
+  max_retries: 1
+gen_kwargs:
+  reasoning_effort: "xhigh"
+  temperature: 1.0
+  top_p: 1.0
+  max_gen_toks: 65536

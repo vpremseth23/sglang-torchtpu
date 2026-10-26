@@ -34,7 +34,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
+        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, muse-spark-aime, muse-spark-gpqa, muse-spark-gsm8k, muse-spark-mmlupro, muse-spark-mmmupro, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -150,6 +150,61 @@ jobs:
       weights_pvc: model-weights
       # Admission is separate; each eval file gets a 90-minute runtime budget.
       timeout_per_file: 5400
+    permissions:
+      contents: read
+      id-token: write
+
+  accuracy-muse-spark:
+    needs: [build, plan]
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","full-set","day-10am","muse-spark","muse-spark-aime","muse-spark-gpqa","muse-spark-gsm8k","muse-spark-mmlupro","muse-spark-mmmupro"]'), needs.plan.outputs.model) }}
+    strategy:
+      fail-fast: false
+      # The current nightly pool has three single-host slices. Queue later
+      # benchmarks in Actions so they retain their full TPU admission budget.
+      max-parallel: 3
+      matrix:
+        include:
+          - benchmark: aime
+            suite: nightly-tpu-accuracy-muse-spark-aime
+            run_name: accuracy-muse-spark-aime
+          - benchmark: gpqa
+            suite: nightly-tpu-accuracy-muse-spark-gpqa
+            run_name: accuracy-muse-spark-gpqa
+          - benchmark: gsm8k
+            suite: nightly-tpu-accuracy-muse-spark-gsm8k
+            run_name: accuracy-muse-spark-gsm8k
+          - benchmark: mmlupro
+            suite: nightly-tpu-accuracy-muse-spark-mmlupro
+            run_name: accuracy-muse-spark-mmlupro
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard0
+            run_name: accuracy-muse-mm-shard0
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard1
+            run_name: accuracy-muse-mm-shard1
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard2
+            run_name: accuracy-muse-mm-shard2
+          - benchmark: mmmupro
+            suite: nightly-tpu-accuracy-muse-spark-mmmupro-shard3
+            run_name: accuracy-muse-mm-shard3
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      enabled: >-
+        ${{ contains(fromJSON('["all","full-set","day-10am","muse-spark"]'), needs.plan.outputs.model)
+            || needs.plan.outputs.model == format('muse-spark-{0}', matrix.benchmark) }}
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      timeout_per_file: 14400
     permissions:
       contents: read
       id-token: write
@@ -419,8 +474,10 @@ jobs:
       id-token: write
 
   collect-full-evaluations:
-    needs: accuracy-multihost
-    if: ${{ always() && needs.accuracy-multihost.result != 'skipped' }}
+    needs: [accuracy-multihost, accuracy-muse-spark]
+    if: >-
+      ${{ always() && (needs.accuracy-multihost.result != 'skipped'
+          || needs.accuracy-muse-spark.result != 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

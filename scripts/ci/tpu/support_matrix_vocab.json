@@ -93,6 +93,7 @@
     "spec": "Speculative decoding",
     "eagle3": "EAGLE3",
     "dflash": "DFlash",
+    "mxint8": "MXINT8 KV cache",
     "dpa": "DP attention",
     "hybrid": "DP attention hybrid (attn-TP>1)",
     "tp": "Tensor parallel",

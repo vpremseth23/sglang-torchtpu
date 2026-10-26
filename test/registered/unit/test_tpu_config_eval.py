@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -118,6 +119,9 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
         "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",
         "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py",
+        "recipe/configs/muse_spark/accuracy.py",
+        "recipe/configs/muse_spark/accuracy_gsm8k.py",
+        "recipe/configs/muse_spark/accuracy_mmmupro.py",
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):
@@ -216,6 +220,188 @@ class TestAccuracyRecipes(unittest.TestCase):
                     )
                     declared.add(script)
         self.assertEqual(declared, set(self.MULTIHOST))
+
+
+class TestMuseSparkMultimodalRecipe(CustomTestCase):
+    """The tokenizer must resolve Muse's native model before any worker starts."""
+
+    def test_multimodal_recipe_registers_native_tokenizer_model(self):
+        import subprocess
+
+        recipe = "recipe/configs/muse_spark/accuracy_mmmupro.py"
+        plan = plan_launch(load_recipe(recipe), inherited=os.environ)
+        # Reproduce tokenizer registration in a fresh process. Importing the
+        # model in this test's interpreter would hide the missing recipe env.
+        script = """
+from sglang.srt.environ import envs
+from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING, import_processors
+from sglang.srt.models.registry import ModelRegistry
+
+package = envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get()
+if package:
+    import_processors(package, overwrite=True)
+arch = "MuseSparkForConditionalGeneration"
+assert ModelRegistry.is_arch_supported(arch), "tokenizer cannot resolve native Muse model"
+model, _ = ModelRegistry.resolve_model_cls(arch)
+assert model.__module__ == "sglang_tpu.models.muse_spark_omni", model
+processors = [p for m, p in PROCESSOR_MAPPING.items() if m.__name__ == arch]
+assert len(processors) == 1, processors
+assert processors[0].__module__ == "sglang_tpu.multimodal.muse_spark_processor", processors
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class TestLMEvalPredictionArchive(CustomTestCase):
+    def test_failed_gate_retains_raw_and_filtered_predictions(self):
+        import base64
+        import io
+        import tarfile
+        import tempfile
+        from contextlib import redirect_stdout
+
+        import numpy as np
+
+        from sglang.test.tpu.evals.eval_support import _LMEvalHarness, lm_eval_runner
+
+        results = {
+            "results": {"mmlu_pro": {"exact_match,custom-extract": np.float64(0.71)}},
+            "samples": {
+                "mmlu_pro_biology": [
+                    {
+                        "doc_id": 0,
+                        "target": "A",
+                        "resps": [[""]],
+                        "filtered_resps": ["[invalid]"],
+                        "exact_match": np.int64(0),
+                    }
+                ]
+            },
+        }
+        config = {
+            "model_name": "muse-test",
+            "archive_predictions": True,
+            "rtol": 0.0,
+            "atol": 0.1,
+            "tasks": [
+                {
+                    "name": "mmlu_pro",
+                    "metrics": [{"name": "exact_match,custom-extract", "value": 0.85}],
+                }
+            ],
+        }
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(config))
+            with (
+                patch.object(_LMEvalHarness, "launch_lm_eval", return_value=results),
+                patch("requests.get"),
+                redirect_stdout(output),
+            ):
+                result = lm_eval_runner(str(path))("http://unused")
+        self.assertFalse(result["_passed"])
+        chunks = [
+            line.split(" ", 1)[1]
+            for line in output.getvalue().splitlines()
+            if line.startswith("FULL_EVAL_ARCHIVE_CHUNK ")
+        ]
+        with tarfile.open(
+            fileobj=io.BytesIO(base64.b64decode("".join(chunks))), mode="r:gz"
+        ) as archive:
+            saved = json.load(archive.extractfile("results.json"))
+            saved_config = json.load(archive.extractfile("config.json"))
+        self.assertEqual(saved_config, config)
+        self.assertEqual(saved["samples"], results["samples"])
+        self.assertEqual(
+            saved["results"]["mmlu_pro"]["exact_match,custom-extract"], 0.71
+        )
+
+
+class TestMuseSparkPDRecipes(CustomTestCase):
+    """P/D role recipes must retain each slice's distributed rendezvous."""
+
+    def test_mxint8_gate_rejects_a_bf16_server(self):
+        from types import SimpleNamespace
+
+        from sglang_tpu.testing.muse_spark_pd import MuseSparkDflashPDTestCase
+
+        class Mxint8Gate(MuseSparkDflashPDTestCase):
+            kv_cache_dtype = "mxint8"
+            prefill_url = "http://prefill"
+            decode_url = "http://decode"
+
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "nnodes": 2,
+                "tp_size": 16,
+                "ep_size": 1,
+                "page_size": 128,
+                "kv_cache_dtype": "bfloat16",
+            },
+        )
+        with patch("requests.get", return_value=response):
+            with self.assertRaisesRegex(
+                AssertionError, "kv_cache_dtype.*mxint8.*bfloat16"
+            ):
+                Mxint8Gate.check_server_configuration()
+
+    def test_every_role_and_dtype_retains_both_hosts(self):
+        from benchmark.tpu.recipe.configs.muse_spark.pd_multihost_prefix_cache_kv_offload_dflash import (
+            role_config,
+        )
+
+        for dtype in ("bfloat16", "mxint8"):
+            for role in ("prefill", "decode"):
+                for rank in (0, 1):
+                    with self.subTest(dtype=dtype, role=role, rank=rank):
+                        hosts = f"pair-{role}-0-0,pair-{role}-0-1"
+                        plan = plan_launch(
+                            role_config(role, kv_cache_dtype=dtype),
+                            inherited={
+                                "TPU_WORKER_ID": str(rank),
+                                "TPU_WORKER_HOSTNAMES": hosts,
+                                # Leaking the single-host base's default drops
+                                # rank 1 and leaves the leader stuck at rendezvous.
+                                "FORCE_SINGLE_HOST": "1",
+                                "SGLANG_SIMULATE_ACC_LEN": "4.05",
+                            },
+                        )
+                        args = plan.config.server_args
+                        self.assertEqual((args["nnodes"], args["node_rank"]), (2, rank))
+                        self.assertEqual(
+                            args["dist_init_addr"],
+                            ("0.0.0.0" if rank == 0 else hosts.split(",")[0])
+                            + ":10011",
+                        )
+                        self.assertEqual(plan.env["TPU_WORKER_HOSTNAMES"], hosts)
+                        self.assertNotIn("FORCE_SINGLE_HOST", plan.env)
+                        self.assertNotIn("SGLANG_SIMULATE_ACC_LEN", plan.env)
+                        self.assertEqual(args["kv_cache_dtype"], dtype)
+                        self.assertEqual(
+                            args["speculative_draft_kv_cache_dtype"], "bfloat16"
+                        )
+                        self.assertEqual(args["speculative_algorithm"], "DFLASH")
+
+                        import argparse
+
+                        from sglang.srt.server_args import ServerArgs
+
+                        parser = argparse.ArgumentParser()
+                        ServerArgs.add_cli_args(parser)
+                        parser.parse_args(
+                            plan.command[
+                                plan.command.index("sglang.launch_server") + 1 :
+                            ]
+                        )
 
 
 class TestWorkloadProfiles(unittest.TestCase):

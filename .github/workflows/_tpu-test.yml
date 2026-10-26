@@ -7,6 +7,11 @@ name: _tpu-test
 on:
   workflow_call:
     inputs:
+      enabled:
+        description: "Run this matrix leg after the caller selects its benchmark"
+        required: false
+        type: boolean
+        default: true
       ref:
         required: true
         type: string
@@ -120,6 +125,7 @@ env:
 
 jobs:
   test:
+    if: ${{ inputs.enabled }}
     name: ${{ inputs.display_name || inputs.suite || inputs.run_name || 'test' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360   # GitHub's hard cap for hosted runners; cannot be raised

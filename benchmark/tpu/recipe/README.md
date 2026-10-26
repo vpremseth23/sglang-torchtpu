@@ -104,6 +104,7 @@ diverge on serving says why in a comment.
 | `gpt_oss_120b/` | `server`, `accuracy`, `accuracy_{aime,gpqa,gsm8k,mmlupro}`, `singlehost_spec`, `pd_singlehost`, `pd_singlehost_{spec,decode_radix,kv_offload,kv_offload_spec,mxint8_multiturn}` | `nightly-tpu-accuracy-gpt-oss-120b-*`, `tpu-integration`, `external-nightly-1host` |
 | `gpt_oss_20b/` | `server`, `accuracy`, `perf`, `spec`, `spec_dpa`, `prefix_cache_kv_offload`, `pcp`, `pp4_pcp2`, `pp4_tp2` | `nightly-tpu-accuracy-gpt-oss-20b`, `nightly-tpu-perf-gpt-oss-20b`, `stage-b-test-tpu-4-v7` |
 | `kimi_k26/` | `mmmu`, `perf` | `nightly-tpu-multihost-accuracy`, `nightly-tpu-perf-kimi-k26` |
+| `muse_spark/` | `server`, `agentic`, `accuracy`, `accuracy_gsm8k`, `accuracy_mmmupro`, `pd_multihost_prefix_cache_kv_offload_dflash{,_mxint8}` | `nightly-tpu-accuracy-muse-spark-*`, `tpu-integration` |
 | `qwen3_0_6b.py` | (flat) | the compile-tracer e2e; single chip |
 | `qwen3_5_397b/` | `server`, `perf` | `nightly-tpu-perf-qwen3-5-397b` |
 | `qwen3_coder_30b_a3b_fp8.py` | (flat) | `stage-b-test-tpu-4-v7` |
@@ -111,6 +112,34 @@ diverge on serving says why in a comment.
 
 A flat `configs/<model>.py` is the older layout for a model with exactly one
 recipe; a model that grows a second variant moves to a directory.
+
+Muse Spark accuracy runs AIME 2025 (three passes), GPQA Diamond, full GSM8K,
+MMLU-Pro (50 examples per subject), and full MMMU-Pro standard-10 (1,730
+questions). Nightly MMMU-Pro uses four disjoint shards (433, 433, 432, 432)
+and rejects missing or duplicated question IDs before reporting the combined
+full-set score. The unsharded test remains a manual reference. Only the
+MMMU-Pro recipe enables the vision tower. The checkpoint
+must be staged at `/weights/Muse-Spark-Open-816B-A42B-NVFP4`. GPQA's reference
+is the [model card](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B),
+and GSM8K's is the TPU first-100 low-effort result. The initial AIME, MMLU-Pro,
+and MMMU-Pro references still need TPU calibration.
+
+Individual benchmarks select `model=muse-spark-aime`,
+`model=muse-spark-gpqa`, `model=muse-spark-gsm8k`,
+`model=muse-spark-mmlupro`, or `model=muse-spark-mmmupro`. The full selection
+runs at most three jobs concurrently. MMLU-Pro retains raw and filtered
+predictions in CI log archives, including when its gate fails.
+
+The Muse P/D gates need two two-host slices and the draft checkpoint at
+`/weights/Muse-Spark-Open-DFlash2`. Both require real DFlash acceptance and a
+complete prefill KV host reload. The MXINT8 variant requires a compatible
+backend extension and fails at startup on images without one.
+
+```sh
+gh workflow run accuracy-test-tpu.yml --ref <branch> -f ref=<branch> -f model=muse-spark
+gh workflow run nightly-test-tpu.yml --ref <branch> -f ref=<branch> \
+  -f only=feature-validation -f test_filter=test_tpu_muse_spark_pd_multihost
+```
 
 ## How tests reach a recipe
 

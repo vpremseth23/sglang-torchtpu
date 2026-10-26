@@ -44,6 +44,8 @@ on:
           - perf
           - mh
           - pd-sh-qwen3-vl-30b
+          - pd-mh-muse-dflash
+          - pd-mh-muse-dflash-mxint8
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
